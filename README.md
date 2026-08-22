@@ -24,6 +24,14 @@ Manually running `ssh-copy-id` against each host in a fleet works fine for a han
 - **Per-host logging** — every run produces a timestamped log file with a pass/skip/fail summary
 - **Flexible targeting** — supports `user@host` per-line overrides, a configurable default user, and a custom SSH port
 
+<img width="888" height="757" alt="Script_screen" src="https://github.com/user-attachments/assets/2a8b7df0-50e0-4ca0-8a4d-3af6b07586bc" />
+
+
+
+
+
+
+
 ## Requirements
 
 - Bash 4+
