@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+#
+# distribute_ssh_key.sh
+#
+# Distributes a local SSH public key to one or more remote hosts by appending
+# it to each host's ~/.ssh/authorized_keys (idempotently — skips hosts that
+# already have the key).
+#
+# Two modes:
+#   Interactive (default) — prompts you to type in each hostname/IP one at a
+#   time, and asks after each one whether you want to add another.
+#
+#   Batch (-f) — reads a pre-built list of hosts from a file, no prompting.
+#
+# Usage:
+#   ./distribute_ssh_key.sh [-k ~/.ssh/id_ed25519.pub] [-u remoteuser] [-p 22] [-n] [-v]
+#   ./distribute_ssh_key.sh -f hosts.txt [-k ~/.ssh/id_ed25519.pub] [-u remoteuser] [-p 22] [-n] [-v]
+#
+# Options:
+#   -f  Path to a file containing one hostname (or user@host) per line.
+#       If omitted, the script prompts interactively for hosts instead.
+#   -k  Path to the public key to distribute. Default: ~/.ssh/id_ed25519.pub
+#   -u  Default remote user to connect as, if not specified per-host
+#       (e.g. host.example.com without a "user@" prefix). Default: current user.
+#   -p  SSH port. Default: 22.
+#   -n  Dry run — show what would happen without making changes.
+#   -v  Verbose SSH output (useful for debugging connection issues).
+#
+# Hosts file format (one entry per line, blank lines and lines starting
+# with # are ignored):
+#   web01.internal.example.com
+#   deploy@web02.internal.example.com
+#   10.0.1.15
+#
+# Exit codes:
+#   0 = all hosts succeeded
+#   1 = one or more hosts failed (see summary + log file)
+#   2 = bad arguments / missing files
+
+set -uo pipefail
+
+# ---- defaults ----
+KEY_FILE="${HOME}/.ssh/id_ed25519.pub"
+DEFAULT_USER="${USER:-$(whoami)}"
+PORT=22
+DRY_RUN=false
+VERBOSE=false
+HOSTS_FILE=""
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="./ssh_key_distribution_${TIMESTAMP}.log"
+
+usage() {
+    grep '^#' "$0" | sed -e 's/^#//' -e '1,2d'
+    exit 2
+}
+
+log() {
+    local msg="$1"
+    echo "$msg" | tee -a "$LOG_FILE"
+}
+
+# ---- parse args ----
+while getopts "f:k:u:p:nvh" opt; do
+    case "$opt" in
+        f) HOSTS_FILE="$OPTARG" ;;
+        k) KEY_FILE="$OPTARG" ;;
+        u) DEFAULT_USER="$OPTARG" ;;
+        p) PORT="$OPTARG" ;;
+        n) DRY_RUN=true ;;
+        v) VERBOSE=true ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+# ---- validation ----
+INTERACTIVE_MODE=false
+if [[ -z "$HOSTS_FILE" ]]; then
+    INTERACTIVE_MODE=true
+elif [[ ! -f "$HOSTS_FILE" ]]; then
+    echo "Error: hosts file '$HOSTS_FILE' not found." >&2
+    exit 2
+fi
+
+if [[ ! -f "$KEY_FILE" ]]; then
+    echo "Error: public key '$KEY_FILE' not found." >&2
+    echo "Generate one with: ssh-keygen -t ed25519 -C \"your_email@example.com\"" >&2
+    exit 2
+fi
+
+# Sanity check: make sure this looks like a public key, not a private key.
+if ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-)' "$KEY_FILE"; then
+    echo "Error: '$KEY_FILE' doesn't look like a valid public key." >&2
+    echo "Did you accidentally point -k at your private key?" >&2
+    exit 2
+fi
+
+PUB_KEY_CONTENT="$(cat "$KEY_FILE")"
+SSH_OPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -p "$PORT")
+$VERBOSE || SSH_OPTS+=(-o LogLevel=ERROR)
+
+# ---- interactive host collection ----
+if $INTERACTIVE_MODE; then
+    TMP_HOSTS_FILE="$(mktemp)"
+    trap 'rm -f "$TMP_HOSTS_FILE"' EXIT
+
+    echo "No hosts file given (-f) — entering interactive mode."
+    echo "Public key will be distributed from: $KEY_FILE"
+    echo "Default remote user: $DEFAULT_USER  |  Port: $PORT"
+    echo ""
+
+    while true; do
+        read -r -p "Enter hostname or IP (or 'user@host' to override the user): " entry
+        entry="$(echo "$entry" | xargs)"
+
+        if [[ -z "$entry" ]]; then
+            echo "  (empty input, skipped)"
+        else
+            echo "$entry" >> "$TMP_HOSTS_FILE"
+            echo "  Added: $entry"
+        fi
+
+        read -r -p "Add another host? [y/N]: " again
+        case "$again" in
+            [Yy]*) continue ;;
+            *) break ;;
+        esac
+    done
+
+    if [[ ! -s "$TMP_HOSTS_FILE" ]]; then
+        echo "No hosts entered. Nothing to do." >&2
+        exit 2
+    fi
+
+    HOSTS_FILE="$TMP_HOSTS_FILE"
+    echo ""
+    echo "Proceeding with $(wc -l < "$HOSTS_FILE" | xargs) host(s):"
+    cat "$HOSTS_FILE"
+    echo ""
+fi
+
+log "=== SSH Key Distribution — $(date) ==="
+log "Key file:    $KEY_FILE"
+log "Hosts file:  $HOSTS_FILE"
+log "Default user: $DEFAULT_USER"
+log "Port:        $PORT"
+log "Dry run:     $DRY_RUN"
+log "----------------------------------------"
+
+SUCCESS_COUNT=0
+SKIP_COUNT=0
+FAIL_COUNT=0
+FAILED_HOSTS=()
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip blank lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+    # Trim whitespace
+    line="$(echo "$line" | xargs)"
+
+    # Support "user@host" or bare "host"
+    if [[ "$line" == *"@"* ]]; then
+        remote_user="${line%%@*}"
+        remote_host="${line##*@}"
+    else
+        remote_user="$DEFAULT_USER"
+        remote_host="$line"
+    fi
+
+    target="${remote_user}@${remote_host}"
+    log ""
+    log ">> $target"
+
+    if $DRY_RUN; then
+        log "   [DRY RUN] Would check/add key on $target"
+        continue
+    fi
+
+    # Check connectivity first
+    if ! ssh "${SSH_OPTS[@]}" "$target" "true" 2>>"$LOG_FILE"; then
+        log "   FAILED: cannot connect (check host/port/user/password auth availability)"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        FAILED_HOSTS+=("$target")
+        continue
+    fi
+
+    # Idempotent remote check-and-append:
+    # - creates ~/.ssh with correct perms if missing
+    # - appends the key only if not already present
+    # - fixes authorized_keys permissions (600) since sshd is picky about this
+    remote_script=$(cat <<EOF
+set -e
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys
+if grep -qF "$PUB_KEY_CONTENT" ~/.ssh/authorized_keys 2>/dev/null; then
+    echo "ALREADY_PRESENT"
+else
+    echo "$PUB_KEY_CONTENT" >> ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+    echo "ADDED"
+fi
+EOF
+)
+
+    result="$(ssh "${SSH_OPTS[@]}" "$target" "$remote_script" 2>>"$LOG_FILE")"
+
+    case "$result" in
+        *ALREADY_PRESENT*)
+            log "   SKIPPED: key already present"
+            SKIP_COUNT=$((SKIP_COUNT + 1))
+            ;;
+        *ADDED*)
+            log "   SUCCESS: key added"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            ;;
+        *)
+            log "   FAILED: unexpected result — check $LOG_FILE for details"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAILED_HOSTS+=("$target")
+            ;;
+    esac
+
+done < "$HOSTS_FILE"
+
+log ""
+log "=== Summary ==="
+log "Added:   $SUCCESS_COUNT"
+log "Skipped: $SKIP_COUNT (already present)"
+log "Failed:  $FAIL_COUNT"
+
+if [[ $FAIL_COUNT -gt 0 ]]; then
+    log ""
+    log "Failed hosts:"
+    for h in "${FAILED_HOSTS[@]}"; do
+        log "  - $h"
+    done
+    log ""
+    log "Full log: $LOG_FILE"
+    exit 1
+fi
+
+log ""
+log "Full log: $LOG_FILE"
+exit 0
